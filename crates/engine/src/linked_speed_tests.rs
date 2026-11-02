@@ -150,3 +150,17 @@ fn speed_with_ripple_on_a_split_edit() {
     assert_eq!((range(&s, picture2), range(&s, sound2)), ((f48, f144), (f48, f168)), "picture 48 to 96 frames, sound 60 to 120");
     assert_eq!((range(&s, picture3).0, range(&s, sound3).0), (f156, f168), "the next sound still starts 12 after its picture");
 }
+
+/// A duration reaches each selected picture and its sound, which end together.
+#[test]
+fn a_duration_applies_to_every_picture_and_its_sound() {
+    let mut s = Session::default();
+    let [(picture1, sound1), (picture2, sound2), _] = three_clips(&mut s);
+    let target = s.sequence_rate().tick_of(24);
+    s.execute("clip.speedDuration", json!({"clips": [picture1.0, picture2.0], "duration": target.0, "ripple": true})).unwrap();
+    s.active_sequence().unwrap().check().unwrap();
+    for c in [picture1, sound1, picture2, sound2] {
+        let (start, end) = range(&s, c);
+        assert_eq!(end - start, target, "clip {} has the duration", c.0);
+    }
+}
