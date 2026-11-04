@@ -843,6 +843,30 @@ fn a_dropped_project_file_opens_and_asks_about_unsaved_changes() {
 
 /// #3817: a duration typed in Speed/Duration with several clips selected gives every clip that
 /// duration, not just the first; one undo restores all of them.
+/// A locked picture is not changed, so the dialog reads its unlocked sound: OK with nothing edited
+/// leaves the sound as it is instead of giving it the picture's speed.
+#[test]
+fn the_dialog_reads_an_unlocked_clip_when_its_picture_is_locked() {
+    let mut d = Driver::new();
+    let picture = d.v1(0);
+    let (sound, v1) = {
+        let q = d.app().session.active_sequence().unwrap();
+        let sound =
+            q.audio_tracks.iter().flat_map(|t| t.items.iter()).find(|i| i.link.is_some() && i.link == picture.link).expect("the picture's sound").clone();
+        (sound, q.video_tracks[0].id.0)
+    };
+    d.exec("sequence.linkedSelection", json!({"on": false}));
+    d.exec("clip.speedDuration", json!({"clips": [picture.id.0], "speed": 50}));
+    d.exec("timeline.setTrack", json!({"track": v1, "locked": true}));
+    d.exec("sequence.linkedSelection", json!({"on": true}));
+    d.exec("timeline.select", json!({"clips": [sound.id.0]}));
+    d.menu("clip.speedDuration");
+    assert_eq!(d.app().ui.clip_dialog.as_ref().unwrap().params["speed"], json!(100.0), "the sound's speed, not the locked picture's");
+    d.click("speedDuration.ok");
+    let after = d.app().session.active_sequence().unwrap().find_item(sound.id).map(|(_, i)| (i.speed, i.duration));
+    assert_eq!(after, Some((sound.speed, sound.duration)), "OK with nothing edited leaves the sound alone");
+}
+
 /// Enter does what OK does: once the duration is no longer valid it applies nothing, not the last
 /// valid duration typed.
 #[test]
