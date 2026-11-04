@@ -2558,6 +2558,7 @@ dependencies = [
  "filmcraft-frame",
  "filmcraft-isobmff",
  "filmcraft-media",
+ "filmcraft-project",
  "filmcraft-time",
  "filmcraft-ui-egui",
  "js-sys",
