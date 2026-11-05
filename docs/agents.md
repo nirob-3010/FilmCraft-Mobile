@@ -14,9 +14,35 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 | Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
-Headless mode also takes `--data-dir DIR` (user presets). Any other option is rejected (exit 2):
-there are no folder-confinement flags such as `--automation-read-root`, so the server can read
-and write wherever the user can.
+Headless mode also takes `--data-dir DIR` (user presets) and the file-confinement flags below.
+Any other option is rejected (exit 2).
+
+**File confinement** (#985, as in VectorCraft and EffectCraft). Start the server with
+`--automation-read-root DIR` and/or `--automation-write-root DIR` (each an existing folder; a
+missing or non-folder one is a usage error, exit 2). A command may then only read files under a
+read root and only write files under a write root. A root left out grants no access of its kind;
+without both flags nothing is confined. While confined:
+
+- Paths must be absolute. Each is resolved (links followed, `..` below a missing folder refused) and
+  must land inside the root, or the tool returns an error naming the root so the agent can correct
+  itself. The named file parameters, any string under a path-like key, and any other absolute path
+  in the parameters are all checked.
+- Every command has to be known to stay inside the roots. One that isn't is refused, and so are
+  commands that can't be kept inside them, each with its reason: render previews, proxies, Project
+  Manager, XMP sidecars, ingest, recovery, and adding to the app's libraries.
+- A command must name its destination where it would otherwise pick one: `tts.create`, `tts.edit`
+  and `audio.voiceover.stop` need `dir`; `file.save`, `file.saveAsTemplate` and
+  `graphics.template.export` need `path`.
+- Headless sessions check every file again as it is opened, so footage a project names outside the
+  read root shows as offline.
+- Bridge mode enforces the command checks before each command reaches the app, and refuses the
+  UI-driving tools (`ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_control`), since they could
+  drive the app's file dialogs past the roots. The app itself is not confined: footage a project
+  names is opened wherever it is.
+
+Not confined: the `--project` file the server was started with (the footage it names is), temporary
+files, the settings and libraries the app keeps in its data folder, and the desktop app's own
+panels. For a server shared between people, give each one their own `--data-dir`.
 
 **Claude Code.** The repository's `.mcp.json` registers both servers (`filmcraft` = bridge,
 `filmcraft-headless` = demo). Both point at `target/release/filmcraft-cli`, so build it first:

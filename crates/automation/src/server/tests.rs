@@ -502,3 +502,190 @@ async fn failed_output_stops_the_reader() {
     let ended = tokio::time::timeout(std::time::Duration::from_secs(30), server).await;
     assert!(ended.is_ok(), "the server kept reading after its output failed");
 }
+
+/// #985: with roots in force, a command reading outside the read root or writing outside the
+/// write root is refused with an error the agent can act on, and one inside passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn confined_server_rejects_paths_outside_the_roots() {
+    let base = std::env::temp_dir().join(format!("fc-mcp-roots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for d in ["in", "out", "outside"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    std::fs::write(base.join("outside/clip.wav"), b"x").unwrap();
+    let roots = AutomationRoots::new(Some(&base.join("in").to_string_lossy()), Some(&base.join("out").to_string_lossy())).unwrap().unwrap();
+    let m = FilmcraftMcp::headless(demo()).with_roots(Some(Arc::new(roots)));
+    // A write inside the write root works and lands there.
+    let r = m.run("markers.exportCsv", json!({"path": base.join("out/markers.csv").to_string_lossy()})).await.unwrap();
+    assert!(base.join("out/markers.csv").exists(), "{r}");
+    // The same write into the read root is refused before the engine touches anything.
+    let e = m.run("markers.exportCsv", json!({"path": base.join("in/markers.csv").to_string_lossy()})).await.unwrap_err();
+    assert!(e.to_string().contains("outside the write root"), "{e}");
+    // Reading a file outside the read root is refused before the engine opens it.
+    let e = m.run("file.mediaPropertiesFile", json!({"path": base.join("outside/clip.wav").to_string_lossy()})).await.unwrap_err();
+    assert!(e.to_string().contains("outside the read root"), "{e}");
+    // Inside the root the check passes: what the engine then says is about the file, not its place.
+    let e = m.run("file.mediaPropertiesFile", json!({"path": base.join("in/clip.wav").to_string_lossy()})).await.unwrap_err();
+    assert!(!e.to_string().contains("automation path rejected"), "{e}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// #985: while confined, the tools that drive the live app's input are refused (they could
+/// drive its file dialogs past the roots), and `initialize` names the confinement.
+#[tokio::test(flavor = "multi_thread")]
+async fn driving_the_ui_is_refused_while_confined() {
+    let base = std::env::temp_dir().join(format!("fc-mcp-roots-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let roots = AutomationRoots::new(Some(&base.to_string_lossy()), None).unwrap().unwrap();
+    let plain = FilmcraftMcp::headless(Session::default());
+    assert!(!plain.get_info().instructions.unwrap().contains("confined"), "unconfined by default");
+    let m = plain.with_roots(Some(Arc::new(roots)));
+    assert!(m.get_info().instructions.unwrap().contains("confined"), "{:?}", m.get_info().instructions);
+    let click = Parameters(ClickParams { id: Some("tools.Razor".into()), x: None, y: None, button: None, count: None, modifiers: None });
+    let r = m.ui_click(click).await.unwrap();
+    assert_eq!(r.is_error, Some(true));
+    let text = serde_json::to_string(&r.content).unwrap();
+    assert!(text.contains("not available while file access is confined"), "{text}");
+    let r = m.ui_control(Parameters(ControlParams { method: "ui.set".into(), params: None })).await.unwrap();
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// A fresh `in` (read root), `out` (write root) and `outside`, with an all-red PNG in `outside`.
+fn roots_base(name: &str) -> (std::path::PathBuf, Arc<AutomationRoots>) {
+    let base = std::env::temp_dir().join(format!("fc-mcp-roots-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for d in ["in", "out", "outside"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    let red = image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 0, 0, 255]));
+    red.save(base.join("outside/secret.png")).unwrap();
+    let roots = AutomationRoots::new(Some(&base.join("in").to_string_lossy()), Some(&base.join("out").to_string_lossy())).unwrap().unwrap();
+    (base, Arc::new(roots))
+}
+
+/// The names in `dir`, sorted.
+fn file_names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    v.sort();
+    v
+}
+
+/// #985: the take's folder is held to the write root, on a real recording.
+#[tokio::test(flavor = "multi_thread")]
+async fn voiceover_take_is_held_to_the_write_root() {
+    let (base, roots) = roots_base("voiceover");
+    let m = FilmcraftMcp::headless(demo()).with_roots(Some(roots));
+    m.run("audio.voiceover.start", json!({"preroll": 0})).await.unwrap();
+    for (params, want) in [
+        (json!({}), "needs `dir`"),
+        (json!({"dir": "../outside"}), "give an absolute path"),
+        (json!({"dir": base.join("outside").to_string_lossy()}), "outside the write root"),
+        (json!({"dir": base.join("in").to_string_lossy()}), "outside the write root"),
+    ] {
+        let e = m.run("audio.voiceover.stop", params).await.unwrap_err();
+        assert!(e.to_string().contains(want), "{e}");
+    }
+    m.run("audio.voiceover.stop", json!({"dir": base.join("out").to_string_lossy()})).await.unwrap();
+    assert!(file_names(&base.join("outside")) == ["secret.png"] && file_names(&base.join("in")).is_empty());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// #985: a project inside the read root that names footage outside it. Unconfined the footage
+/// reaches the frame (the control); confined it is read as missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn footage_a_project_names_is_held_to_the_read_root() {
+    let (base, roots) = roots_base("footage");
+    let secret = base.join("outside/secret.png").to_string_lossy().into_owned();
+    let project = base.join("in/p.fcproj").to_string_lossy().into_owned();
+    let mut s = Session::default();
+    s.execute("file.newProject", json!({"name": "p"})).unwrap();
+    s.execute("file.newSequence", json!({"name": "s", "width": 64, "height": 64})).unwrap();
+    let item = s.execute("file.import", json!({"paths": [secret]})).unwrap()["items"][0].as_u64().unwrap();
+    s.execute("timeline.place", json!({"item": item, "track": "V1", "seconds": 0.0})).unwrap();
+    s.execute("file.saveAs", json!({"path": project})).unwrap();
+
+    let frame = async |m: &FilmcraftMcp, name: &str| {
+        let out = base.join("out").join(name);
+        m.run("file.exportFrame", json!({"path": out.to_string_lossy(), "time": 0})).await.unwrap();
+        image::open(&out).unwrap().to_rgba8().get_pixel(32, 32).0
+    };
+    let plain = FilmcraftMcp::headless(Session::default());
+    plain.run("file.open", json!({"path": project})).await.unwrap();
+    assert_eq!(frame(&plain, "plain.png").await[..3], [255, 0, 0], "the control: unconfined, the footage is read");
+
+    let confined = FilmcraftMcp::headless(Session::default()).with_roots(Some(roots));
+    confined.run("file.open", json!({"path": project})).await.unwrap();
+    assert_ne!(frame(&confined, "confined.png").await[..3], [255, 0, 0], "the footage outside the read root reached the frame");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// #985: a project's ingest settings can't copy an imported file to a folder of their own.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_is_skipped_while_confined() {
+    let (base, roots) = roots_base("ingest");
+    let clip = base.join("in/clip.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255])).save(&clip).unwrap();
+    let mut s = demo();
+    s.execute("project.ingestSettings", json!({"enabled": true, "action": "copy", "destination": base.join("outside/ingest").to_string_lossy()})).unwrap();
+    let m = FilmcraftMcp::headless(s).with_roots(Some(roots));
+    let r = m.run("file.import", json!({"paths": [clip.to_string_lossy()]})).await.unwrap();
+    assert_eq!(r["ingest"]["skipped"], "file access is confined", "{r}");
+    assert_eq!(file_names(&base.join("outside")), ["secret.png"]);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// #985: sources a session opened before it was confined (`--project` at start-up, say) were made
+/// with unrestricted services. They must not keep reading: a still decoded earlier, and an image
+/// sequence whose later frames load on demand. Each is exported unconfined first, as the control.
+#[tokio::test(flavor = "multi_thread")]
+async fn sources_opened_before_confinement_are_dropped() {
+    let (base, roots) = roots_base("cached");
+    let red = image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 0, 0, 255]));
+    for n in 1..=48 {
+        red.save(base.join(format!("outside/seq_{n:04}.png"))).unwrap();
+    }
+    let imports = [
+        json!({"paths": [base.join("outside/secret.png").to_string_lossy()]}),
+        json!({"paths": [base.join("outside/seq_0001.png").to_string_lossy()], "imageSequence": true}),
+    ];
+    for (n, import) in imports.into_iter().enumerate() {
+        let mut s = Session::default();
+        s.execute("file.newProject", json!({"name": "p"})).unwrap();
+        s.execute("file.newSequence", json!({"name": "s", "width": 64, "height": 64})).unwrap();
+        let item = s.execute("file.import", import).unwrap()["items"][0].as_u64().unwrap();
+        s.execute("timeline.place", json!({"item": item, "track": "V1", "seconds": 0.0})).unwrap();
+        let before = base.join(format!("out/before{n}.png"));
+        s.execute("file.exportFrame", json!({"path": before.to_string_lossy(), "seconds": 0.0})).unwrap();
+        assert_eq!(image::open(&before).unwrap().to_rgba8().get_pixel(32, 32).0[..3], [255, 0, 0], "the control, case {n}");
+
+        let m = FilmcraftMcp::headless(s).with_roots(Some(roots.clone()));
+        // Later in the clip, so a sequence has to load a frame it hasn't loaded yet.
+        let after = base.join(format!("out/after{n}.png"));
+        m.run("file.exportFrame", json!({"path": after.to_string_lossy(), "seconds": 0.5})).await.unwrap();
+        assert_ne!(image::open(&after).unwrap().to_rgba8().get_pixel(32, 32).0[..3], [255, 0, 0], "case {n}: footage outside the read root reached the frame");
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+fn session_with_job(result: Option<Result<filmcraft_engine::export::Report, String>>) -> Session {
+    let mut s = Session::default();
+    s.jobs.push(filmcraft_engine::Job { id: 1, label: "export".into(), progress: Arc::default(), result: Arc::new(Mutex::new(result)) });
+    s
+}
+
+/// A running job holds sources opened before the roots, which reads through them would not check.
+#[test]
+#[should_panic(expected = "confine the session before starting jobs")]
+fn confining_a_session_with_a_running_job_panics() {
+    let (_base, roots) = roots_base("running-job");
+    let _ = FilmcraftMcp::headless(session_with_job(None)).with_roots(Some(roots));
+}
+
+/// A job that has finished holds nothing, so it doesn't stand in the way.
+#[test]
+fn confining_a_session_after_a_job_finished_works() {
+    let (_base, roots) = roots_base("finished-job");
+    let _ = FilmcraftMcp::headless(session_with_job(Some(Err("done".into())))).with_roots(Some(roots));
+}
